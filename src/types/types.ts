@@ -1,3 +1,5 @@
+import { JSONSchema4 } from "json-schema";
+
 export type JRPC_REQUEST = {
     jsonrpc: string;
     method: string;
@@ -24,7 +26,31 @@ export type PARAM = {
 }
 
 export type JRPC_METHOD = {
-    name: string;
-    params: Array<PARAM>;
+    schema: JRPC_SCHEMA_METHOD,
     handler: Function;
 }
+
+export type JRPC_SCHEMA = {
+    version: string;
+    methods: Array<JRPC_SCHEMA_METHOD>;
+}
+
+export type JRPC_SCHEMA_METHOD = {
+    name: string;
+    description: string;
+    params: Array<JRPC_SCHEMA_METHOD_PARAM>;
+    result: JSONSchema4;
+}
+
+export type JRPC_SCHEMA_METHOD_PARAM = {
+    name: string;
+    description: string;
+    schema: JSONSchema4;
+    required?: boolean;
+}
+
+export type JRPC_SCHEMA_METHOD_RESULT = {
+    name: string;
+    description: string;
+    schema: JSONSchema4;
+} 

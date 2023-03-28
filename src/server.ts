@@ -1,5 +1,10 @@
+import Ajv from 'ajv';
 import { ErrorResponse } from "./DTOs/errors";
-import { JRPC_REQUEST, JRPC_RESPONSE, JRPC_ERROR, JRPC_METHOD, PARAM } from "./types/types";
+import { JRPC_METHOD, JRPC_REQUEST, JRPC_RESPONSE, JRPC_SCHEMA, JRPC_SCHEMA_METHOD } from "./types/types";
+
+const ajv = new Ajv({
+    strictTuples: false
+});
 
 const VERSION = '2.0';
 
@@ -22,34 +27,32 @@ const ERROR_MESSAGES = {
 }
 
 export default class Server {
-
     private methods: JRPC_METHOD[] = [];
 
     // check if method exists
     private methodExists(name: string): boolean {
-        return !!this.methods.find((method) => method.name === name);
+        return !!this.methods.find((method) => method.schema.name === name);
     }
 
     // find method by name
     private findMethod(name: string): JRPC_METHOD | null {
-        return this.methods.find((method) => method.name === name) || null;
+        return this.methods.find((method) => method.schema.name === name) || null;
     }
 
     // add method to container
-    public addMethod(name: string, params: PARAM[], handler: Function) {
+    public addMethod(schema: JRPC_SCHEMA_METHOD, handler: Function) {
         if (typeof handler !== 'function') {
             throw new Error('Handler must be a function');
         }
-        if (this.methodExists(name)) {
-            throw new Error(`Method ${name} already exists`);
+        if (this.methodExists(schema.name)) {
+            throw new Error(`Method ${schema.name} already exists`);
         }
         this.methods.push({
-            name,
-            params: params,
+            schema,
             handler,
         });
     }
-    
+
     // create response
     private createResponse(request: JRPC_REQUEST, result: object | Array<any>): JRPC_RESPONSE {
         return {
@@ -82,9 +85,12 @@ export default class Server {
     }
 
     // validate request
-    private validateRequest(request: JRPC_REQUEST): void {
+    private validateRequest(request: JRPC_REQUEST): boolean {
         const method = this.findMethod(request.method);
-        if (request.jsonrpc !== VERSION) {
+        if (!request.jsonrpc || request.jsonrpc !== VERSION) {
+            throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_REQUEST], parseInt(ERRORS.INVALID_REQUEST));
+        }
+        if (!request.id) {
             throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_REQUEST], parseInt(ERRORS.INVALID_REQUEST));
         }
         if (!request.method) {
@@ -94,53 +100,65 @@ export default class Server {
             throw new ErrorResponse(ERROR_MESSAGES[ERRORS.METHOD_NOT_FOUND], parseInt(ERRORS.METHOD_NOT_FOUND));
         }
         // validate params
-        // TODO test better
-        if(Array.isArray(method.params)) {
-            if (typeof request.params === 'object' && !Array.isArray(request.params)) {
-                const valuesKeys = Object.keys(request.params);
-                if (valuesKeys.length !== method.params.length) {
-                    throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_PARAMS], parseInt(ERRORS.INVALID_PARAMS));
-                }
-                for(let i = 0; i < valuesKeys.length; i++) {
-                    const found = method.params.find(param => param.name === valuesKeys[i])
-                    if(!found) {
-                        throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_PARAMS], parseInt(ERRORS.INVALID_PARAMS));
-                    }
-                    // @ts-ignore
-                    if (typeof request.params[valuesKeys[i]] !== found.type) {
-                        throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_PARAMS], parseInt(ERRORS.INVALID_PARAMS));
-                    }
-                }
-            } else if (Array.isArray(request.params)) {
-                if (request.params.length !== method.params.length) {
-                    throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_PARAMS], parseInt(ERRORS.INVALID_PARAMS));
-                }
-                for (let i = 0; i < request.params.length; i++) {
-                    if (typeof request.params[i] !== method.params[i].type) {
-                        throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_PARAMS], parseInt(ERRORS.INVALID_PARAMS));
-                    }
-                }
+        let schema = {};
+
+        if (Array.isArray(request.params)) {
+            if (request.params.length === 0) {
+                schema = {
+                    type: 'array'
+                };
+            } else {
+                schema = {
+                    type: 'array',
+                    items: method.schema.params.map((param) => param.schema),
+                    minItems: method.schema.params.filter((param) => param.required).length
+                };
             }
+        } else if (typeof request.params === 'object' && !Array.isArray(request.params)) {
+            schema = {
+                type: 'object',
+                properties: {},
+                required: [],
+                additionalProperties: false
+            };
+            method.schema.params.forEach((param) => {
+                // @ts-ignore
+                schema.properties[param.name] = param.schema;
+                if (param.required) {
+                    // @ts-ignore
+                    schema.required.push(param.name);
+                }
+            });
         }
+
+        try {
+            const validate = ajv.compile(schema);
+            if (!validate(request.params)) {
+                throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_PARAMS], parseInt(ERRORS.INVALID_PARAMS));
+            }
+        } catch (e) {
+            throw new ErrorResponse(ERROR_MESSAGES[ERRORS.INVALID_PARAMS], parseInt(ERRORS.INVALID_PARAMS));
+        }
+
+        return true;
     }
 
     // handle request
-    private handleRequest(request: JRPC_REQUEST): JRPC_RESPONSE {
+    private async handleRequest(request: JRPC_REQUEST): Promise<JRPC_RESPONSE> {
         try {
             this.validateRequest(request);
             const method = this.findMethod(request.method);
             // prepare params as input for handler
-            const params = [];
-            if (!Array.isArray(request!.params)) {
-                // put values in array in the right order
-                for (let i = 0; i < method!.params.length; i++) {
-                    // @ts-ignore
-                    params.push(request.params[method.params[i].name]);
-                }
-            } else {
+            const params: any[] = [];
+            if (Array.isArray(request.params)) {
                 params.push(...request.params);
+            } else {
+                method!.schema.params.forEach((param) => {
+                    // @ts-ignore
+                    params.push(request.params[param.name]);
+                });
             }
-            const result = method?.handler(...params);
+            const result = await method!.handler(...params);
             return this.createResponse(request, result);
         } catch (e) {
             if (e instanceof ErrorResponse) {
@@ -156,17 +174,17 @@ export default class Server {
     }
 
     // execute request
-    public executeRequest(request: string): JRPC_RESPONSE | JRPC_RESPONSE[] {
+    public async executeRequest(request: string): Promise<JRPC_RESPONSE | JRPC_RESPONSE[]> {
         try {
             const parsedRequest: JRPC_REQUEST | JRPC_REQUEST[] = this.parseRequest(request);
             if (Array.isArray(parsedRequest)) {
-                const responses = [];
-                for (let i = 0; i < parsedRequest.length; i++) {
-                    responses.push(this.handleRequest(parsedRequest[i]));
+                const responses: JRPC_RESPONSE[] = [];
+                for (const req of parsedRequest) {
+                    responses.push(await this.handleRequest(req));
                 }
                 return responses;
             } else {
-                return this.handleRequest(parsedRequest);
+                return await this.handleRequest(parsedRequest);
             }
         } catch (e) {
             if (e instanceof ErrorResponse) {
@@ -180,4 +198,13 @@ export default class Server {
             }
         }
     }
+
+    // return the server schema
+    public getSchema(): JRPC_SCHEMA {
+        return {
+            version: VERSION,
+            methods: this.methods.map((method) => method.schema),
+        };
+    }
+
 }
